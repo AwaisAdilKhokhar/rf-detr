@@ -95,8 +95,41 @@ def get_user_input() -> dict:
         print("⚠️  Invalid threshold, using 0.3")
         threshold = 0.3
     
-    # 4. Optimization mode
-    print("\n[4/4] Enable optimize_for_inference()? (May give 2x speedup)")
+    # 4. Input resolution (HUGE SPEEDUP)
+    print("\n[4/6] Set inference resolution (lower = faster):")
+    print("  • 1 = 416x416 (fastest, ~4x speedup, good for most cases)")
+    print("  • 2 = 640x640 (balanced, ~2-3x speedup, recommended)")
+    print("  • 3 = 800x800 (slower, better accuracy)")
+    print("  • 4 = Original resolution (slowest, best accuracy)")
+    
+    resolution_input = input("\nEnter choice (1-4) [default: 2]: ").strip() or "2"
+    
+    resolution_map = {
+        "1": 416,
+        "2": 640,
+        "3": 800,
+        "4": None,  # Original resolution
+    }
+    inference_size = resolution_map.get(resolution_input, 640)
+    
+    # 5. Frame skipping (MAJOR SPEEDUP)
+    print("\n[5/6] Set frame skip (process every Nth frame):")
+    print("  • 1 = Process every frame (slowest, most accurate)")
+    print("  • 2 = Process every 2nd frame (2x faster)")
+    print("  • 3 = Process every 3rd frame (3x faster, recommended)")
+    print("  • 5 = Process every 5th frame (5x faster)")
+    
+    skip_input = input("\nEnter frame skip [default: 3]: ").strip()
+    
+    try:
+        frame_skip = int(skip_input) if skip_input else 3
+        frame_skip = max(1, min(10, frame_skip))  # Clamp to [1, 10]
+    except ValueError:
+        print("⚠️  Invalid frame skip, using 3")
+        frame_skip = 3
+    
+    # 6. Optimization mode
+    print("\n[6/6] Enable optimize_for_inference()? (May give 2x speedup)")
     print("  1 - Yes (experimental, may fail on some systems)")
     print("  2 - No (recommended, already fast with native PyTorch)")
     
@@ -108,6 +141,8 @@ def get_user_input() -> dict:
     print(f"  • Video source: {video_source}")
     print(f"  • Model: {['rfdetr-nano', 'rfdetr-small', 'rfdetr-medium', 'rfdetr-base'][int(model_choice)-1]}")
     print(f"  • Confidence threshold: {threshold}")
+    print(f"  • Inference resolution: {f'{inference_size}x{inference_size}' if inference_size else 'Original'}")
+    print(f"  • Frame skip: Every {frame_skip} frame(s) (~{frame_skip}x speedup)")
     print(f"  • TorchScript optimization: {'Enabled (experimental)' if optimize else 'Disabled (native PyTorch)'}")
     
     confirm = input("\nStart detection? (y/n) [default: y]: ").strip().lower()
@@ -119,6 +154,8 @@ def get_user_input() -> dict:
         "video_source": video_source,
         "model_choice": model_choice,
         "threshold": threshold,
+        "inference_size": inference_size,
+        "frame_skip": frame_skip,
         "optimize": optimize,
     }
 
@@ -170,7 +207,15 @@ def main() -> None:
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
-    print(f"\n📹 Video: {width}x{height} @ {fps} FPS")
+    # Calculate inference resolution
+    inference_size = config['inference_size']
+    if inference_size:
+        print(f"\n📹 Video: {width}x{height} @ {fps} FPS")
+        print(f"🔍 Inference: {inference_size}x{inference_size} (scaled for speed)")
+    else:
+        print(f"\n📹 Video: {width}x{height} @ {fps} FPS")
+        print(f"🔍 Inference: {width}x{height} (original resolution)")
+    
     print(f"🎯 Threshold: {config['threshold']}")
     print("\n" + "=" * 60)
     print("▶️  Processing... Press 'q' to quit")
@@ -185,6 +230,13 @@ def main() -> None:
     start_time = time.time()
     fps_display = 0
     
+    # Frame skipping variables
+    frame_skip = config["frame_skip"]
+    current_frame_idx = 0
+    last_detections = None
+    last_labels = []
+    inference_count = 0
+    
     try:
         while True:
             ret, frame = cap.read()
@@ -192,36 +244,68 @@ def main() -> None:
                 print("\n✓ End of video or stream interrupted")
                 break
             
-            # Convert BGR to RGB for RF-DETR
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # Only run inference on every Nth frame
+            if current_frame_idx % frame_skip == 0:
+                # Prepare frame for inference
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                
+                # Resize frame if inference_size is set (MAJOR SPEEDUP)
+                # Smaller resolution = faster inference (2-4x speedup at 640x640 vs 1920x1080)
+                # We'll scale detections back to original size for accurate annotation
+                if inference_size:
+                    frame_resized = cv2.resize(frame_rgb, (inference_size, inference_size))
+                    scale_x = width / inference_size
+                    scale_y = height / inference_size
+                else:
+                    frame_resized = frame_rgb
+                    scale_x = 1.0
+                    scale_y = 1.0
+                
+                # Run inference with native RF-DETR predict()
+                last_detections = model.predict(frame_resized, threshold=config["threshold"])
+                
+                # Scale detections back to original frame size
+                if inference_size and last_detections is not None and len(last_detections) > 0:
+                    # Scale bounding boxes back to original resolution
+                    last_detections.xyxy[:, [0, 2]] *= scale_x  # x coordinates
+                    last_detections.xyxy[:, [1, 3]] *= scale_y  # y coordinates
+                
+                # Create labels
+                last_labels = [
+                    f"{COCO_CLASSES[class_id]} {confidence:.2f}"
+                    for class_id, confidence in zip(last_detections.class_id, last_detections.confidence)
+                ]
+                
+                inference_count += 1
             
-            # Run inference with native RF-DETR predict()
-            detections = model.predict(frame_rgb, threshold=config["threshold"])
-            
-            # Create labels
-            labels = [
-                f"{COCO_CLASSES[class_id]} {confidence:.2f}"
-                for class_id, confidence in zip(detections.class_id, detections.confidence)
-            ]
+            # Use last detection results (even for skipped frames)
+            detections = last_detections
+            labels = last_labels
             
             # Annotate frame
             annotated_frame = frame.copy()
-            annotated_frame = box_annotator.annotate(annotated_frame, detections)
-            annotated_frame = label_annotator.annotate(annotated_frame, detections, labels)
+            if detections is not None:
+                annotated_frame = box_annotator.annotate(annotated_frame, detections)
+                annotated_frame = label_annotator.annotate(annotated_frame, detections, labels)
             
             # Calculate and display FPS
             frame_count += 1
+            current_frame_idx += 1
             if frame_count % 30 == 0:  # Update FPS every 30 frames
                 elapsed = time.time() - start_time
                 fps_display = frame_count / elapsed
             
-            # Add FPS text to frame
+            # Add performance info to frame
+            info_text = f"FPS: {fps_display:.1f} | Inferences: {inference_count}"
+            if inference_size:
+                info_text += f" | Resolution: {inference_size}x{inference_size}"
+            
             cv2.putText(
                 annotated_frame,
-                f"FPS: {fps_display:.1f}",
+                info_text,
                 (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                1,
+                0.7,
                 (0, 255, 0),
                 2,
             )
@@ -253,7 +337,9 @@ def main() -> None:
             elapsed = time.time() - start_time
             avg_fps = frame_count / elapsed
             print(f"\n📊 Statistics:")
-            print(f"  • Frames processed: {frame_count}")
+            print(f"  • Frames displayed: {frame_count}")
+            print(f"  • Inferences run: {inference_count}")
+            print(f"  • Speedup factor: {frame_count / max(inference_count, 1):.1f}x")
             print(f"  • Total time: {elapsed:.1f}s")
             print(f"  • Average FPS: {avg_fps:.1f}")
 
