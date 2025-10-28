@@ -290,6 +290,9 @@ class OptimizedPTZTracker(SimulatedPTZ):
         self.inference_size = inference_size  # square size or None
         self.selected_hold_frames = 30
         self.selected_last_seen_frame = 0
+        # Display scaling (display window -> frame coordinates)
+        self.display_scale_x = 1.0
+        self.display_scale_y = 1.0
         
         # MODEL LOADING (native RF-DETR)
         model_map = {
@@ -489,7 +492,10 @@ class OptimizedPTZTracker(SimulatedPTZ):
     
     def mouse_callback(self, event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN and self.tracking_enabled:
-            self.select_track_at(x, y)
+            # Map window coordinates to frame coordinates if the display is resized
+            fx = int(x * self.display_scale_x)
+            fy = int(y * self.display_scale_y)
+            self.select_track_at(fx, fy)
         elif event == cv2.EVENT_RBUTTONDOWN:
             self.clear_selection()
     
@@ -684,8 +690,13 @@ class OptimizedPTZTracker(SimulatedPTZ):
                 if processed is not None:
                     if (processed.shape[1], processed.shape[0]) != (self.output_width, self.output_height):
                         display = cv2.resize(processed, (self.output_width, self.output_height))
+                        # Update scaling factors from display -> original processed frame
+                        self.display_scale_x = processed.shape[1] / float(self.output_width)
+                        self.display_scale_y = processed.shape[0] / float(self.output_height)
                     else:
                         display = processed
+                        self.display_scale_x = 1.0
+                        self.display_scale_y = 1.0
                     cv2.imshow('TRACKING VIEW', display)
                 ptz_frame = self.get_ptz_frame()
                 if ptz_frame is not None:
