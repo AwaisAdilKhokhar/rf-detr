@@ -359,6 +359,11 @@ class OptimizedPTZTracker(SimulatedPTZ):
         cv2.namedWindow('PTZ VIEW', cv2.WINDOW_NORMAL)
         cv2.resizeWindow('TRACKING VIEW', 1280, 720)
         cv2.resizeWindow('PTZ VIEW', 960, 540)
+        try:
+            cv2.setWindowProperty('TRACKING VIEW', cv2.WND_PROP_ASPECT_RATIO, cv2.WINDOW_FREERATIO)
+            cv2.setWindowProperty('PTZ VIEW', cv2.WND_PROP_ASPECT_RATIO, cv2.WINDOW_FREERATIO)
+        except Exception:
+            pass
         cv2.setMouseCallback('TRACKING VIEW', self.mouse_callback)
         
         print("✅ Optimized RF-DETR Tracker Ready!")
@@ -676,7 +681,12 @@ class OptimizedPTZTracker(SimulatedPTZ):
                     break
                 frame = self.original_frame.copy()
                 processed = self.process_frame(frame)
-                cv2.imshow('TRACKING VIEW', processed)
+                if processed is not None:
+                    if (processed.shape[1], processed.shape[0]) != (self.output_width, self.output_height):
+                        display = cv2.resize(processed, (self.output_width, self.output_height))
+                    else:
+                        display = processed
+                    cv2.imshow('TRACKING VIEW', display)
                 ptz_frame = self.get_ptz_frame()
                 if ptz_frame is not None:
                     selected_track = self.get_selected_track()
