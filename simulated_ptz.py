@@ -213,10 +213,35 @@ class SimulatedPTZ:
             "ESC: Exit"
         ]
         
-        y_offset = 30
+        # Compute bounding box for text block
+        font = cv2.FONT_HERSHEY_DUPLEX
+        font_scale = 0.6
+        thickness = 1
+        line_height = 25
+        padding = 10
+        max_w = 0
+        for text in info_text:
+            (w, h), _ = cv2.getTextSize(text, font, font_scale, thickness)
+            if w > max_w:
+                max_w = w
+        box_w = max_w + padding * 2
+        box_h = line_height * len(info_text) + padding
+        x1, y1 = 10, 10
+        x2, y2 = x1 + box_w, y1 + box_h
+        
+        # Semi-transparent background
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.35, frame, 0.65, 0, frame)
+        
+        # Draw text in white with blue accent for headings
+        y = y1 + padding + 15
         for i, text in enumerate(info_text):
-            cv2.putText(frame, text, (10, y_offset + i * 25),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            color = (255, 255, 255)
+            if text == "Controls:" or text == "":
+                color = (255, 204, 102)  # light blue heading/accent
+            cv2.putText(frame, text, (x1 + padding, y), font, font_scale, color, thickness, cv2.LINE_AA)
+            y += line_height
     
     def read_frame(self):
         """Read a frame from the camera"""

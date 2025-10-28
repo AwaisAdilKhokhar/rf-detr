@@ -51,6 +51,7 @@ class ImprovedByteTracker:
         self.low_thresh = 0.1
         self.max_lost = max_lost
         self.min_box_area = min_box_area
+        self.max_lost_selected = max_lost * 3
         
         self.tracks_active: List[STrack] = []
         self.tracks_lost: List[STrack] = []
@@ -58,7 +59,7 @@ class ImprovedByteTracker:
         
         self.min_hit_streak = 1
     
-    def update(self, detections):
+    def update(self, detections, selected_track_id: Optional[int] = None):
         removed = []
         
         for track in self.tracks_active + self.tracks_lost:
@@ -68,7 +69,8 @@ class ImprovedByteTracker:
             for track in self.tracks_active + self.tracks_lost:
                 track.frames_lost += 1
                 track.hit_streak = 0
-                if track.frames_lost > self.max_lost:
+                max_lost_allowed = self.max_lost_selected if (selected_track_id is not None and track.track_id == selected_track_id) else self.max_lost
+                if track.frames_lost > max_lost_allowed:
                     track.state = 'removed'
                     if track.exit_time is None:
                         track.exit_time = time.time()
@@ -87,7 +89,8 @@ class ImprovedByteTracker:
             for track in self.tracks_active + self.tracks_lost:
                 track.frames_lost += 1
                 track.hit_streak = 0
-                if track.frames_lost > self.max_lost:
+                max_lost_allowed = self.max_lost_selected if (selected_track_id is not None and track.track_id == selected_track_id) else self.max_lost
+                if track.frames_lost > max_lost_allowed:
                     track.state = 'removed'
                     if track.exit_time is None:
                         track.exit_time = time.time()
@@ -117,6 +120,29 @@ class ImprovedByteTracker:
         unmatched_tracks_lost = []
         if len(self.tracks_lost) > 0 and len(unmatched_dets_high) > 0:
             remaining_high = [high_dets[i] for i in unmatched_dets_high]
+            # First, try to re-associate the selected lost track with a lower threshold
+            if selected_track_id is not None:
+                sel_indices = [i for i, t in enumerate(self.tracks_lost) if t.track_id == selected_track_id]
+                if len(sel_indices) > 0:
+                    sel_idx = sel_indices[0]
+                    ious = []
+                    for j, det in enumerate(remaining_high):
+                        ious.append((j, self._iou(self.tracks_lost[sel_idx].bbox, det[:4])))
+                    if len(ious) > 0:
+                        best_det_idx, best_iou = max(ious, key=lambda x: x[1])
+                        if best_iou >= 0.2:
+                            track = self.tracks_lost[sel_idx]
+                            track.bbox = np.array(remaining_high[best_det_idx][:4])
+                            track.score = remaining_high[best_det_idx][4]
+                            track.frames_lost = 0
+                            track.hit_streak = max(1, track.hit_streak + 1)
+                            track.state = 'tracked'
+                            self.tracks_active.append(track)
+                            self.tracks_lost.remove(track)
+                            # remove this det from unmatched_dets_high
+                            det_global_idx = unmatched_dets_high[best_det_idx]
+                            unmatched_dets_high = [i for i in unmatched_dets_high if i != det_global_idx]
+                            remaining_high = [high_dets[i] for i in unmatched_dets_high]
             matched_lost, unmatched_tracks_lost, unmatched_dets_high2 = self._match_detections(
                 self.tracks_lost, remaining_high, thresh=0.4
             )
@@ -138,7 +164,8 @@ class ImprovedByteTracker:
             if idx < len(self.tracks_lost):
                 self.tracks_lost[idx].frames_lost += 1
                 self.tracks_lost[idx].hit_streak = 0
-                if self.tracks_lost[idx].frames_lost > self.max_lost:
+                max_lost_allowed = self.max_lost_selected if (selected_track_id is not None and self.tracks_lost[idx].track_id == selected_track_id) else self.max_lost
+                if self.tracks_lost[idx].frames_lost > max_lost_allowed:
                     self.tracks_lost[idx].state = 'removed'
                     if self.tracks_lost[idx].exit_time is None:
                         self.tracks_lost[idx].exit_time = time.time()
@@ -165,7 +192,8 @@ class ImprovedByteTracker:
             track = self.tracks_active[idx]
             track.frames_lost += 1
             track.hit_streak = 0
-            if track.frames_lost > self.max_lost:
+            max_lost_allowed = self.max_lost_selected if (selected_track_id is not None and track.track_id == selected_track_id) else self.max_lost
+            if track.frames_lost > max_lost_allowed:
                 track.state = 'removed'
                 if track.exit_time is None:
                     track.exit_time = time.time()
@@ -177,6 +205,20 @@ class ImprovedByteTracker:
         self.tracks_active = [t for t in self.tracks_active if t.state == 'tracked']
         
         for idx in unmatched_dets_high:
+            # Avoid creating a new track if this detection overlaps selected lost track; reassign instead
+            if selected_track_id is not None:
+                sel_lost = [t for t in self.tracks_lost if t.track_id == selected_track_id]
+                if len(sel_lost) > 0:
+                    if self._iou(sel_lost[0].bbox, high_dets[idx][:4]) >= 0.2:
+                        track = sel_lost[0]
+                        track.bbox = np.array(high_dets[idx][:4])
+                        track.score = high_dets[idx][4]
+                        track.frames_lost = 0
+                        track.hit_streak = max(1, track.hit_streak + 1)
+                        track.state = 'tracked'
+                        self.tracks_active.append(track)
+                        self.tracks_lost.remove(track)
+                        continue
             if high_dets[idx][4] >= self.track_thresh * 0.8:
                 new_track = STrack(
                     track_id=self.track_id_count,
@@ -246,6 +288,8 @@ class OptimizedPTZTracker(SimulatedPTZ):
         self.use_gpu = use_gpu and torch.cuda.is_available()
         self.device = torch.device('cuda' if self.use_gpu else 'cpu')
         self.inference_size = inference_size  # square size or None
+        self.selected_hold_frames = 30
+        self.selected_last_seen_frame = 0
         
         # MODEL LOADING (native RF-DETR)
         model_map = {
@@ -403,7 +447,7 @@ class OptimizedPTZTracker(SimulatedPTZ):
             self.last_detect_frame = self.frame_count
             self.detect_time = time.time() - t1
         
-        self.active_tracks, removed = self.tracker.update(det_list)
+        self.active_tracks, removed = self.tracker.update(det_list, self.selected_track_id)
         for track in self.tracker.tracks_lost[:]:
             bbox = self.track_boxes.get(track.track_id, track.bbox)
             if self.is_near_edge(bbox, w, h):
@@ -417,6 +461,12 @@ class OptimizedPTZTracker(SimulatedPTZ):
                 self.exited_tracks.append((track.track_id, track.exit_time, bbox))
         self.exited_tracks = [(tid, etime, bbox) for tid, etime, bbox in self.exited_tracks if etime > time.time() - 10]
         self._smooth_track_boxes()
+        # Update last seen for selected
+        if self.selected_track_id is not None:
+            for t in self.active_tracks:
+                if t.track_id == self.selected_track_id:
+                    self.selected_last_seen_frame = self.frame_count
+                    break
         current_ids = {track.track_id for track in self.active_tracks}
         self.track_boxes = {tid: box for tid, box in self.track_boxes.items() if tid in current_ids}
         return self.active_tracks
@@ -464,6 +514,12 @@ class OptimizedPTZTracker(SimulatedPTZ):
         for track in self.active_tracks:
             if track.track_id == self.selected_track_id and track.state == 'tracked':
                 return track
+        # Fallback: return lost selected track within hold window
+        for track in getattr(self.tracker, 'tracks_lost', []):
+            if track.track_id == self.selected_track_id:
+                # optionally clamp to last known smoothed box
+                if self.selected_last_seen_frame and (self.frame_count - self.selected_last_seen_frame) <= getattr(self, 'selected_hold_frames', 30):
+                    return track
         return None
     
     def smooth_ptz(self, pan, tilt, zoom):
@@ -492,24 +548,39 @@ class OptimizedPTZTracker(SimulatedPTZ):
             x2, y2 = int(det['xmax']), int(det['ymax'])
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 1)
             label = f"{det['name']}: {det['confidence']:.2f}"
-            cv2.putText(frame, label, (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+            cv2.putText(frame, label, (x1, y1-5), cv2.FONT_HERSHEY_DUPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
     
     def draw_tracks(self, frame):
-        for track in self.active_tracks:
+        tracks_to_draw = list(self.active_tracks)
+        # If selected track is not active but exists as lost within hold, include it for drawing
+        if self.selected_track_id is not None and all(t.track_id != self.selected_track_id for t in tracks_to_draw):
+            for t in self.tracker.tracks_lost:
+                if t.track_id == self.selected_track_id and (self.frame_count - self.selected_last_seen_frame) <= getattr(self, 'selected_hold_frames', 30):
+                    tracks_to_draw.append(t)
+                    break
+        for track in tracks_to_draw:
             if track.state != 'tracked':
-                continue
+                # draw only if it's the selected track within hold window
+                if track.track_id != self.selected_track_id:
+                    continue
             x1, y1, x2, y2 = map(int, track.bbox)
             if x1 >= x2 or y1 >= y2:
                 continue
             is_selected = (track.track_id == self.selected_track_id)
-            color = (0, 0, 255) if is_selected else (0, 255, 0)
+            color = (0, 0, 255) if is_selected else (255, 204, 102)
             thickness = 3 if is_selected else 2
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
-            label = f"ID:{track.track_id}"
-            conf_str = f"{track.score:.2f}"
-            label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-            cv2.rectangle(frame, (x1, y1-20), (x1+label_size[0]+40, y1), color, -1)
-            cv2.putText(frame, f"{label} {conf_str}", (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+            label_text = f"ID:{track.track_id} {track.score:.2f}"
+            font = cv2.FONT_HERSHEY_DUPLEX
+            (tw, th), baseline = cv2.getTextSize(label_text, font, 0.6, 1)
+            bg_x1 = x1
+            bg_y2 = y1
+            bg_y1 = max(0, bg_y2 - th - 8)
+            bg_x2 = x1 + tw + 12
+            overlay = frame.copy()
+            cv2.rectangle(overlay, (bg_x1, bg_y1), (bg_x2, bg_y2), (0, 0, 0), -1)
+            cv2.addWeighted(overlay, 0.45, frame, 0.55, 0, frame)
+            cv2.putText(frame, label_text, (bg_x1 + 6, bg_y2 - 6), font, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
     
     def draw_exited_indicators(self, frame):
         h, w = frame.shape[:2]
@@ -519,13 +590,13 @@ class OptimizedPTZTracker(SimulatedPTZ):
             cy = int((bbox[1] + bbox[3]) / 2)
             timestamp_str = datetime.fromtimestamp(etime).strftime("%H:%M:%S")
             label = f"ID:{tid} @ {timestamp_str}"
-            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_DUPLEX, 0.5, 1)
             text_x = cx - tw // 2
             text_y = cy - 20 if direction != 'top' else cy + th + 20
             text_x = max(0, min(text_x, w - tw - 10))
             text_y = max(th + 5, min(text_y, h - 10))
             cv2.rectangle(frame, (text_x - 5, text_y - th - 5), (text_x + tw + 5, text_y + 5), (0, 0, 0), -1)
-            cv2.putText(frame, label, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            cv2.putText(frame, label, (text_x, text_y), cv2.FONT_HERSHEY_DUPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
             arrow_length = 15
             arrow_color = (0, 0, 255)
             if direction == 'left':
@@ -581,7 +652,6 @@ class OptimizedPTZTracker(SimulatedPTZ):
             self.draw_raw_detections(frame)
         self.draw_tracks(frame)
         self.draw_exited_indicators(frame)
-        self.draw_status(frame)
         return frame
     
     def run(self):
@@ -612,7 +682,14 @@ class OptimizedPTZTracker(SimulatedPTZ):
                     selected_track = self.get_selected_track()
                     if selected_track:
                         info = f"Tracking ID: {selected_track.track_id}"
-                        cv2.putText(ptz_frame, info, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                        font = cv2.FONT_HERSHEY_DUPLEX
+                        (tw, th), base = cv2.getTextSize(info, font, 0.7, 1)
+                        ox1, oy1 = 10, 10
+                        ox2, oy2 = 10 + tw + 12, 10 + th + 12
+                        overlay = ptz_frame.copy()
+                        cv2.rectangle(overlay, (ox1, oy1), (ox2, oy2), (0, 0, 0), -1)
+                        cv2.addWeighted(overlay, 0.4, ptz_frame, 0.6, 0, ptz_frame)
+                        cv2.putText(ptz_frame, info, (ox1 + 6, oy2 - 6), font, 0.7, (255, 204, 102), 1, cv2.LINE_AA)
                     cv2.imshow('PTZ VIEW', ptz_frame)
                 key = cv2.waitKey(1) & 0xFF
                 if key == 27:
